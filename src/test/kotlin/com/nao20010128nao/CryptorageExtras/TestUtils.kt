@@ -3,7 +3,7 @@ package com.nao20010128nao.CryptorageExtras
 import com.google.common.io.ByteSink
 import com.google.common.io.ByteSource
 import com.nao20010128nao.Cryptorage.Cryptorage
-import com.nao20010128nao.Cryptorage.internal.file.FileSource
+import com.nao20010128nao.Cryptorage.FileSource
 import com.nao20010128nao.Cryptorage.newMemoryFileSource
 import com.nao20010128nao.Cryptorage.withV1Encryption
 
@@ -26,25 +26,14 @@ fun FileSource.fakeWrap(): Cryptorage {
             this@fakeWrap.delete(name)
         }
 
-        override fun gc() {
-        }
-
+        override fun gc() = Unit
         override fun lastModified(name: String): Long = this@fakeWrap.lastModified(name)
-
-        override fun list(): Array<String> = this@fakeWrap.list()
-
+        override fun list(): List<String> = this@fakeWrap.list()
         override fun meta(key: String): String? = null
-
-        override fun meta(key: String, value: String) {
-        }
-
-        override fun mv(from: String, to: String) {
-        }
-
+        override fun meta(key: String, value: String) = Unit
+        override fun mv(from: String, to: String) = Unit
         override fun open(name: String, offset: Int): ByteSource = this@fakeWrap.open(name, offset)
-
         override fun put(name: String): ByteSink = this@fakeWrap.put(name)
-
         override fun size(name: String): Long = this@fakeWrap.size(name)
     }
 }
