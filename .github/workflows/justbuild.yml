@@ -16,5 +16,5 @@ jobs:
         distribution: 'adopt'
 
     - name: Build with Gradle
-      run: gradle assemble
+      run: gradle compileKotlin
 
