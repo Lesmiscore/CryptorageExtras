@@ -15,7 +15,7 @@ class Tests {
                 "b-d" to zeroBytes
         ).newMemoryFileSource()
         val prefix = mem.withNamePrefixed("a-")
-        require(prefix.list().contentEquals(arrayOf("a", "b", "c", "d")))
+        require(prefix.list().toSet() == setOf("a", "b", "c", "d"))
     }
 
     @Test
@@ -28,7 +28,7 @@ class Tests {
                 "b" to zeroBytes
         ).newMemoryFileSource()
         val prefix = mem.withSplitFilesCombined()
-        require(prefix.list().contentEquals(arrayOf("a", "b")))
+        require(prefix.list().toSet() == setOf("a", "b"))
     }
 
     @Test
