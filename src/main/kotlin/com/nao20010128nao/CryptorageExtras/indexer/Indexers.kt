@@ -2,6 +2,7 @@
 
 package com.nao20010128nao.CryptorageExtras.indexer
 
+import com.beust.klaxon.JsonArray
 import com.beust.klaxon.JsonObject
 import com.google.common.collect.HashMultimap
 import com.google.common.io.ByteSource
@@ -37,6 +38,7 @@ interface Indexer<T : Indexer<T>> {
     fun serialize(): ByteSource
     fun bloomFilter(): ByteArray
     fun writeTo(fs: FileSource)
+    fun writeTree(fs: FileSource, clean: Boolean = true)
 }
 
 class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
@@ -50,7 +52,12 @@ class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
         val index = readIndex(fs)
         index.files.forEach { (name, file) ->
             finalIndex.files[name] = file.copy(files = file.files.map {
-                URL(url.protocol, url.host, url.port, "${url.path}/$it${if (url.query.isNullOrBlank()) "" else "?${url.query}"}").toString()
+                URL(
+                    url.protocol,
+                    url.host,
+                    url.port,
+                    "${url.path}/$it${if (url.query.isNullOrBlank()) "" else "?${url.query}"}"
+                ).toString()
             }.toMutableList())
         }
     }
@@ -114,8 +121,8 @@ class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
             val size = pieces.asSequence().map { size(it) }.fold(0L, Long::plus)
             // build a new file
             val newFile = finalIndex.files[pieces[0]]!!.copy(
-                    files = allFiles.toMutableList(),
-                    size = size
+                files = allFiles.toMutableList(),
+                size = size
             )
             // remove old files
             pieces.forEach(this@V1Indexer::delete)
@@ -137,7 +144,7 @@ class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
         root["files"] = finalIndex.files.mapValues { it.value.toJsonMap() }
         // BLOOM_FILTER is unused as of e2aea0
         root["meta"] = mapOf(
-                BLOOM_FILTER to bloomFilter().encodeBase64ToString()
+            BLOOM_FILTER to bloomFilter().encodeBase64ToString()
         )
         ByteArrayInputStream(root.toJsonString(false).utf8Bytes())
     }.encrypt(keys)
@@ -156,10 +163,90 @@ class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
         fs.put(MANIFEST_INDEX).writeFrom(serialize().openBufferedStream())
     }
 
+    override fun writeTree(fs: FileSource, clean: Boolean) {
+        if (clean) {
+            val hierarchyFiles = try {
+                fs.open(MANIFEST_INDEX_HIERARCHICAL_LIST).openStream().reader().use { reader ->
+                    klaxon.parseJsonArray(reader).map { it.toString() }
+                }
+            } catch (e: Throwable) {
+                emptyList<String>()
+            }
+            hierarchyFiles.forEach {
+                wish {
+                    fs.delete(it)
+                }
+            }
+        }
+        source {
+            val root = JsonObject()
+            root["files"] = emptyMap<String, Any?>()
+            root["meta"] = mapOf<String, Any?>("hierarchical" to "true")
+            root["hierarchical"] = "true"
+            ByteArrayInputStream(root.toJsonString(false).utf8Bytes())
+        }.encrypt(keys).copyTo(fs.put(MANIFEST_INDEX))
+
+        val files = list().sorted()
+        val filesPerLeaf = 10
+
+        data class TreeNode(val name: String, val start: String, val end: String)
+
+        val leaves = files.chunked(filesPerLeaf)
+        val dataToWrite = mutableMapOf<String, String>()
+        val previousLayer = mutableListOf<TreeNode>()
+        var deepness = 1
+        // generate leaves
+        for ((index, leave) in leaves.withIndex()) {
+            dataToWrite["${MANIFEST_INDEX_HIERARCHICAL_LEAF}_${index}"] = JsonObject().also {
+                it["files"] = finalIndex.files
+                    .filterKeys { it in leave }
+                    .also { require(it.size == leave.size) }
+                    .mapValues { it.value.toJsonMap() }
+                it["type"] = "leaf"
+            }.toJsonString()
+            previousLayer += TreeNode("${MANIFEST_INDEX_HIERARCHICAL_LEAF}_${index}", leave.first(), leave.last())
+        }
+        // generate nodes
+        while (previousLayer.size > 1) {
+            val nodes = previousLayer.chunked(filesPerLeaf)
+            previousLayer.clear()
+            deepness++
+            for ((index, node) in nodes.withIndex()) {
+                val fname = "${MANIFEST_INDEX_HIERARCHICAL_NODE}_${deepness}_${index}"
+                dataToWrite[fname] = JsonObject().also {
+                    it["start"] = node.first().start
+                    it["end"] = node.last().end
+                    it["child"] = node.map { it.name }
+                    it["child_start"] = node.map { it.start }
+                    it["type"] = "node"
+                }.toJsonString()
+                previousLayer += TreeNode(fname, node.first().start, node.last().end)
+            }
+        }
+        require(previousLayer[0].start == files.first())
+        require(previousLayer[0].end == files.last())
+        dataToWrite[MANIFEST_INDEX_HIERARCHICAL_ROOT] = dataToWrite[previousLayer[0].name]!!
+        dataToWrite.remove(previousLayer[0].name)
+
+        // generate list
+        dataToWrite[MANIFEST_INDEX_HIERARCHICAL_LIST] = JsonArray(dataToWrite.keys).toJsonString(false)
+
+        // write all nodes
+        for ((name, data) in dataToWrite) {
+            source { ByteArrayInputStream(data.utf8Bytes()) }
+                .encrypt(keys).copyTo(fs.put(name))
+        }
+    }
+
     companion object {
         const val MANIFEST: String = "manifest"
         const val MANIFEST_INDEX: String = "manifest_index"
         const val BLOOM_FILTER: String = "bloom_filter"
+
+        const val MANIFEST_INDEX_HIERARCHICAL_LIST: String = "manifest_hierarchical_list"
+        const val MANIFEST_INDEX_HIERARCHICAL_ROOT: String = "manifest_hierarchical_root"
+        const val MANIFEST_INDEX_HIERARCHICAL_NODE: String = "manifest_hierarchical_node"
+        const val MANIFEST_INDEX_HIERARCHICAL_LEAF: String = "manifest_hierarchical_leaf"
 
         private fun populateKeys(password: String): AesKeys {
             val utf8Bytes1 = password.utf8Bytes()
@@ -178,15 +265,24 @@ class V1Indexer(private val keys: AesKeys) : Indexer<V1Indexer> {
 
     private data class Index(val files: MutableMap<String, CryptorageFile> = mutableMapOf())
 
-    private data class CryptorageFile(val files: MutableList<String> = ArrayList(), val splitSize: Int = 0, var lastModified: Long = 0, var size: Long = 0) {
-        constructor(file: JsonObject) :
-                this(file.array<String>("files")!!.toMutableList(), file.int("splitSize")!!, file.long("lastModified")!!, file.long("size")!!)
+    private data class CryptorageFile(
+        val files: MutableList<String> = ArrayList(),
+        val splitSize: Int = 0,
+        var lastModified: Long = 0,
+        var size: Long = 0
+    ) {
+        constructor(file: JsonObject) : this(
+            file.array<String>("files")!!.toMutableList(),
+            file.int("splitSize")!!,
+            file.long("lastModified")!!,
+            file.long("size")!!
+        )
 
         fun toJsonMap(): Map<String, Any> = mapOf(
-                "files" to files,
-                "splitSize" to splitSize,
-                "lastModified" to lastModified,
-                "size" to size
+            "files" to files,
+            "splitSize" to splitSize,
+            "lastModified" to lastModified,
+            "size" to size
         )
     }
 }
@@ -203,7 +299,12 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
         val index = readIndex(fs)
         index.files.forEach { (name, file) ->
             finalIndex.files[name] = file.copy(files = file.files.map {
-                URL(url.protocol, url.host, url.port, "${url.path}/$it${if (url.query.isNullOrBlank()) "" else "?${url.query}"}").toString()
+                URL(
+                    url.protocol,
+                    url.host,
+                    url.port,
+                    "${url.path}/$it${if (url.query.isNullOrBlank()) "" else "?${url.query}"}"
+                ).toString()
             }.toMutableList())
         }
     }
@@ -269,9 +370,9 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
             val size = pieces.asSequence().map { size(it) }.fold(0L, Long::plus)
             // build a new file
             val newFile = finalIndex.files[pieces[0]]!!.copy(
-                    files = allFiles.toMutableList(),
-                    nonce = allNonce.toMutableList(),
-                    size = size
+                files = allFiles.toMutableList(),
+                nonce = allNonce.toMutableList(),
+                size = size
             )
             // remove old files
             pieces.forEach(this@V3Indexer::delete)
@@ -293,7 +394,7 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
         root["files"] = finalIndex.files.mapValues { it.value.toJsonMap() }
         // BLOOM_FILTER is unused as of e2aea0
         root["meta"] = mapOf(
-                BLOOM_FILTER to bloomFilter().encodeBase64ToString()
+            BLOOM_FILTER to bloomFilter().encodeBase64ToString()
         )
         ByteArrayInputStream(root.toJsonString(false).utf8Bytes())
     }.encrypt(keys)
@@ -310,6 +411,85 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
 
     override fun writeTo(fs: FileSource) {
         fs.put(MANIFEST_INDEX).writeFrom(serialize().openBufferedStream())
+    }
+
+    override fun writeTree(fs: FileSource, clean: Boolean) {
+        if (clean) {
+            val hierarchyFiles = try {
+                fs.open(V1Indexer.MANIFEST_INDEX_HIERARCHICAL_LIST).openStream().reader().use { reader ->
+                    klaxon.parseJsonArray(reader).map { it.toString() }
+                }
+            } catch (e: Throwable) {
+                emptyList<String>()
+            }
+            hierarchyFiles.forEach {
+                wish {
+                    fs.delete(it)
+                }
+            }
+        }
+        source {
+            val root = JsonObject()
+            root["files"] = emptyMap<String, Any?>()
+            root["meta"] = mapOf<String, Any?>("hierarchical" to "true")
+            root["hierarchical"] = "true"
+            ByteArrayInputStream(root.toJsonString(false).utf8Bytes())
+        }.encrypt(keys).copyTo(fs.put(V1Indexer.MANIFEST_INDEX))
+
+        val files = list().sorted()
+        val filesPerLeaf = 10
+
+        data class TreeNode(val name: String, val start: String, val end: String)
+
+        val leaves = files.chunked(filesPerLeaf)
+        val dataToWrite = mutableMapOf<String, String>()
+        val previousLayer = mutableListOf<TreeNode>()
+        var deepness = 1
+        // generate leaves
+        for ((index, leave) in leaves.withIndex()) {
+            dataToWrite["${V1Indexer.MANIFEST_INDEX_HIERARCHICAL_LEAF}_${index}"] = JsonObject().also {
+                it["files"] = finalIndex.files
+                    .filterKeys { it in leave }
+                    .also { require(it.size == leave.size) }
+                    .mapValues { it.value.toJsonMap() }
+                it["type"] = "leaf"
+            }.toJsonString()
+            previousLayer += TreeNode(
+                "${V1Indexer.MANIFEST_INDEX_HIERARCHICAL_LEAF}_${index}",
+                leave.first(),
+                leave.last()
+            )
+        }
+        // generate nodes
+        while (previousLayer.size > 1) {
+            val nodes = previousLayer.chunked(filesPerLeaf)
+            previousLayer.clear()
+            deepness++
+            for ((index, node) in nodes.withIndex()) {
+                val fname = "${V1Indexer.MANIFEST_INDEX_HIERARCHICAL_NODE}_${deepness}_${index}"
+                dataToWrite[fname] = JsonObject().also {
+                    it["start"] = node.first().start
+                    it["end"] = node.last().end
+                    it["child"] = node.map { it.name }
+                    it["child_start"] = node.map { it.start }
+                    it["type"] = "node"
+                }.toJsonString()
+                previousLayer += TreeNode(fname, node.first().start, node.last().end)
+            }
+        }
+        require(previousLayer[0].start == files.first())
+        require(previousLayer[0].end == files.last())
+        dataToWrite[V1Indexer.MANIFEST_INDEX_HIERARCHICAL_ROOT] = dataToWrite[previousLayer[0].name]!!
+        dataToWrite.remove(previousLayer[0].name)
+
+        // generate list
+        dataToWrite[V1Indexer.MANIFEST_INDEX_HIERARCHICAL_LIST] = JsonArray(dataToWrite.keys).toJsonString(false)
+
+        // write all nodes
+        for ((name, data) in dataToWrite) {
+            source { ByteArrayInputStream(data.utf8Bytes()) }
+                .encrypt(keys).copyTo(fs.put(name))
+        }
     }
 
     companion object {
@@ -332,7 +512,8 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
         } else {
             keys
         }
-        val data = parseJson(AesDecryptorByteSource(source.open(manifestName), manifestKeys).asCharSource().openStream())
+        val data =
+            parseJson(AesDecryptorByteSource(source.open(manifestName), manifestKeys).asCharSource().openStream())
         val files = data.obj("files")!!.mapValues { CryptorageFile(it.value as JsonObject) }
         Index(files.toMutableMap())
     } else {
@@ -342,30 +523,30 @@ class V3Indexer(private val keys: AesKeys) : Indexer<V3Indexer> {
     private data class Index(val files: MutableMap<String, CryptorageFile> = mutableMapOf())
 
     private data class CryptorageFile(
-            val files: MutableList<String> = ArrayList(),
-            val nonce: MutableList<BigInteger> = ArrayList(),
-            val splitSize: Int = 0,
-            var lastModified: Long = 0,
-            var size: Long = 0
+        val files: MutableList<String> = ArrayList(),
+        val nonce: MutableList<BigInteger> = ArrayList(),
+        val splitSize: Int = 0,
+        var lastModified: Long = 0,
+        var size: Long = 0
     ) {
         constructor(file: JsonObject) :
                 this(
-                        file.array<String>("files")!!.toMutableList(),
-                        // allow reading V1 cryptorage (V1 is also acceptable as V3, with all nonce are zero)
-                        (file.array<String>("nonce")?.map { it.toBigInteger() }
-                                ?: List<BigInteger>(file.array<String>("files")!!.size) { BigInteger.ZERO })
-                                .toMutableList(),
-                        file.int("splitSize")!!,
-                        file.long("lastModified")!!,
-                        file.long("size")!!
+                    file.array<String>("files")!!.toMutableList(),
+                    // allow reading V1 cryptorage (V1 is also acceptable as V3, with all nonce are zero)
+                    (file.array<String>("nonce")?.map { it.toBigInteger() }
+                        ?: List<BigInteger>(file.array<String>("files")!!.size) { BigInteger.ZERO })
+                        .toMutableList(),
+                    file.int("splitSize")!!,
+                    file.long("lastModified")!!,
+                    file.long("size")!!
                 )
 
         fun toJsonMap(): Map<String, Any> = mapOf(
-                "files" to files,
-                "nonce" to nonce.map { "$it" },
-                "splitSize" to splitSize,
-                "lastModified" to lastModified,
-                "size" to size
+            "files" to files,
+            "nonce" to nonce.map { "$it" },
+            "splitSize" to splitSize,
+            "lastModified" to lastModified,
+            "size" to size
         )
     }
 }
