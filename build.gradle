@@ -15,7 +15,7 @@ repositories {
 }
 
 dependencies {
-    implementation 'com.beust:klaxon:5.0.7'
+    implementation 'com.beust:klaxon:5.5'
     implementation 'com.github.nao20010128nao:Cryptorage:51e7c1c8'
     implementation 'org.apache.ftpserver:ftpserver-core:1.1.1'
     implementation 'org.jetbrains.kotlin:kotlin-stdlib-jdk8'
